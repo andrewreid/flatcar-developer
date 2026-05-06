@@ -1,0 +1,344 @@
+name: Build Flatcar Developer Image and Create Release
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+    inputs:
+      stream:
+        description: 'Flatcar stream(s) to build'
+        type: choice
+        options: [all, stable, beta, alpha]
+        default: stable
+      force:
+        description: 'Rebuild even if tag already exists'
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build:
+    name: ${{ matrix.flatcar_track }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        flatcar_track: [stable, beta, alpha]
+    steps:
+      - name: Filter by stream input
+        id: filter
+        run: |
+          set -euo pipefail
+          STREAM="${{ github.event.inputs.stream || 'all' }}"
+          if [ "$STREAM" != "all" ] && [ "$STREAM" != "${{ matrix.flatcar_track }}" ]; then
+            echo "skip_track=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_track=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Checkout
+        if: steps.filter.outputs.skip_track == 'false'
+        uses: actions/checkout@v6
+
+      - name: Resolve current Flatcar version
+        id: meta
+        if: steps.filter.outputs.skip_track == 'false'
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://${{ matrix.flatcar_track }}.release.flatcar-linux.net/amd64-usr/current/version.txt" -o version.txt
+          cat version.txt
+          FLATCAR_VERSION=$(grep -E '^FLATCAR_VERSION=' version.txt | cut -d= -f2-)
+          FLATCAR_BUILD=$(grep -E '^FLATCAR_BUILD=' version.txt | cut -d= -f2-)
+          if [ -z "${FLATCAR_VERSION}" ]; then
+            echo "::error::FLATCAR_VERSION missing from upstream version.txt" >&2
+            exit 1
+          fi
+          echo "version=${FLATCAR_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "build=${FLATCAR_BUILD}" >> "$GITHUB_OUTPUT"
+          rm -f version.txt
+
+      - name: Login to GHCR
+        if: steps.filter.outputs.skip_track == 'false'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        if: steps.filter.outputs.skip_track == 'false'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Decide which images need building
+        id: skip
+        if: steps.filter.outputs.skip_track == 'false'
+        env:
+          FORCE: ${{ github.event.inputs.force || 'false' }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          probe() { docker buildx imagetools inspect "$1" >/dev/null 2>&1; }
+          if [ "$FORCE" = "true" ]; then
+            echo "skip_base=false"    >> "$GITHUB_OUTPUT"
+            echo "skip_sources=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if probe "${IMAGE}:${VERSION}"; then
+            echo "skip_base=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_base=false" >> "$GITHUB_OUTPUT"
+          fi
+          if probe "${IMAGE}:${VERSION}-sources"; then
+            echo "skip_sources=true"  >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_sources=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Cache rootfs tarball
+        id: cache_rootfs
+        if: steps.skip.outputs.skip_base == 'false'
+        uses: actions/cache@v5
+        with:
+          path: rootfs.tar
+          key: rootfs-${{ runner.os }}-${{ matrix.flatcar_track }}-${{ steps.meta.outputs.version }}
+
+      - name: Download Flatcar developer container
+        if: steps.skip.outputs.skip_base == 'false' && steps.cache_rootfs.outputs.cache-hit != 'true'
+        env:
+          TRACK: ${{ matrix.flatcar_track }}
+          VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          curl -fL "https://${TRACK}.release.flatcar-linux.net/amd64-usr/${VERSION}/flatcar_developer_container.bin.bz2" \
+            -o flatcar_developer_container.bin.bz2
+          bunzip2 flatcar_developer_container.bin.bz2
+
+      - name: Extract rootfs tarball
+        if: steps.skip.outputs.skip_base == 'false' && steps.cache_rootfs.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          mkdir -p mnt
+          sudo mount -o ro,loop,offset=2097152 flatcar_developer_container.bin mnt
+          sudo tar -cp --one-file-system -C mnt -f rootfs.tar .
+          sudo umount mnt
+          rmdir mnt
+          rm -f flatcar_developer_container.bin
+          sudo chown "$USER:$USER" rootfs.tar
+          ls -lh rootfs.tar
+
+      - name: Compute base image tags & labels
+        id: tags_base
+        if: steps.skip.outputs.skip_base == 'false'
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.meta.outputs.version }}
+            type=raw,value=${{ matrix.flatcar_track }}
+          labels: |
+            org.opencontainers.image.title=Flatcar Container Linux developer container
+            org.opencontainers.image.description=Flatcar ${{ matrix.flatcar_track }} ${{ steps.meta.outputs.version }} developer container
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            
+      - name: Build & push base image
+        id: push_base
+        if: steps.skip.outputs.skip_base == 'false'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile.base
+          push: true
+          tags: ${{ steps.tags_base.outputs.tags }}
+          labels: ${{ steps.tags_base.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.flatcar_track }}-base
+          cache-to: type=gha,mode=max,scope=${{ matrix.flatcar_track }}-base
+
+      - name: Remove base build context tarball
+        if: steps.skip.outputs.skip_base == 'false'
+        run: rm -f rootfs.tar
+
+      - name: Compute sources image tags & labels
+        id: tags_sources
+        if: steps.skip.outputs.skip_sources == 'false'
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=raw,value=${{ steps.meta.outputs.version }}-sources
+            type=raw,value=${{ matrix.flatcar_track }}-sources
+          labels: |
+            org.opencontainers.image.title=Flatcar Container Linux developer container with kernel sources
+            org.opencontainers.image.description=Flatcar ${{ matrix.flatcar_track }} ${{ steps.meta.outputs.version }} developer container with kernel sources at /usr/src/linux
+            org.opencontainers.image.version=${{ steps.meta.outputs.version }}-sources
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+
+      - name: Build & push sources image
+        id: build_sources
+        if: steps.skip.outputs.skip_sources == 'false'
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: Dockerfile
+          push: true
+          provenance: true
+          tags: ${{ steps.tags_sources.outputs.tags }}
+          labels: ${{ steps.tags_sources.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.flatcar_track }}-sources
+          cache-to: type=gha,mode=max,scope=${{ matrix.flatcar_track }}-sources
+          build-args: |
+            BASE_REGISTRY=${{ env.REGISTRY }}
+            BASE_IMAGE=${{ env.IMAGE_NAME }}
+            FLATCAR_VERSION=${{ steps.meta.outputs.version }}
+            FLATCAR_BUILD=${{ steps.meta.outputs.build }}
+            FLATCAR_TRACK=${{ matrix.flatcar_track }}
+
+  release:
+    name: release ${{ matrix.flatcar_track }}
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: read
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        flatcar_track: [stable, beta, alpha]
+    steps:
+      - name: Filter by stream input
+        id: filter
+        run: |
+          set -euo pipefail
+          STREAM="${{ github.event.inputs.stream || 'all' }}"
+          if [ "$STREAM" != "all" ] && [ "$STREAM" != "${{ matrix.flatcar_track }}" ]; then
+            echo "skip_track=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_track=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Resolve current Flatcar version
+        id: meta
+        if: steps.filter.outputs.skip_track == 'false'
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://${{ matrix.flatcar_track }}.release.flatcar-linux.net/amd64-usr/current/version.txt" -o version.txt
+          FLATCAR_VERSION=$(grep -E '^FLATCAR_VERSION=' version.txt | cut -d= -f2-)
+          if [ -z "${FLATCAR_VERSION}" ]; then
+            echo "::error::FLATCAR_VERSION missing from upstream version.txt" >&2
+            exit 1
+          fi
+          echo "version=${FLATCAR_VERSION}" >> "$GITHUB_OUTPUT"
+          rm -f version.txt
+
+      - name: Resolve stable Flatcar version
+        id: stable
+        if: steps.filter.outputs.skip_track == 'false'
+        run: |
+          set -euo pipefail
+          curl -fsSL "https://stable.release.flatcar-linux.net/amd64-usr/current/version.txt" -o stable-version.txt
+          STABLE_VERSION=$(grep -E '^FLATCAR_VERSION=' stable-version.txt | cut -d= -f2-)
+          if [ -z "${STABLE_VERSION}" ]; then
+            echo "::error::FLATCAR_VERSION missing from stable version.txt" >&2
+            exit 1
+          fi
+          echo "version=${STABLE_VERSION}" >> "$GITHUB_OUTPUT"
+          rm -f stable-version.txt
+
+      - name: Login to GHCR
+        if: steps.filter.outputs.skip_track == 'false'
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Buildx
+        if: steps.filter.outputs.skip_track == 'false'
+        uses: docker/setup-buildx-action@v4
+
+      - name: Probe release subjects
+        id: release_gate
+        if: steps.filter.outputs.skip_track == 'false'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          STABLE_VERSION: ${{ steps.stable.outputs.version }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          digest_of() {
+            docker buildx imagetools inspect "$1" --format '{{ .Manifest.Digest }}' 2>/dev/null || true
+          }
+          BASE_DIGEST=$(digest_of "${IMAGE}:${VERSION}")
+          SOURCES_DIGEST=$(digest_of "${IMAGE}:${VERSION}-sources")
+          if [ -z "${BASE_DIGEST}" ] && [ -z "${SOURCES_DIGEST}" ]; then
+            echo "skip_release=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_release=false" >> "$GITHUB_OUTPUT"
+          fi
+          if [ "${VERSION}" = "${STABLE_VERSION}" ]; then
+            echo "make_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "make_latest=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "base_digest=${BASE_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "sources_digest=${SOURCES_DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Compose release notes
+        if: steps.release_gate.outputs.skip_release == 'false'
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          BASE_DIGEST: ${{ steps.release_gate.outputs.base_digest }}
+          SOURCES_DIGEST: ${{ steps.release_gate.outputs.sources_digest }}
+        run: |
+          set -euo pipefail
+          IMAGE="${REGISTRY}/${IMAGE_NAME}"
+          {
+            echo "Flatcar Container Linux developer container — version \`${VERSION}\`."
+            echo
+            echo "## Images"
+            echo
+            if [ -n "${BASE_DIGEST}" ]; then
+              echo "- Base: \`docker pull ${IMAGE}:${VERSION}\`"
+              echo "  - digest: \`${BASE_DIGEST}\`"
+            fi
+            if [ -n "${SOURCES_DIGEST}" ]; then
+              echo "- Sources: \`docker pull ${IMAGE}:${VERSION}-sources\`"
+              echo "  - digest: \`${SOURCES_DIGEST}\`"
+            fi
+            echo
+            echo "## Verifying provenance"
+            echo
+            echo '```'
+            echo "gh attestation verify oci://${IMAGE}:${VERSION} --owner ${{ github.repository_owner }}"
+            echo '```'
+            echo
+            echo "## Upstream"
+            echo
+            echo "- Flatcar release notes: https://www.flatcar.org/releases#release-${VERSION}"
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create or update GitHub Release
+        if: steps.release_gate.outputs.skip_release == 'false'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.meta.outputs.version }}
+          name: ${{ steps.meta.outputs.version }}
+          body_path: release-notes.md
+          make_latest: ${{ steps.release_gate.outputs.make_latest }}
+          fail_on_unmatched_files: false

@@ -1,0 +1,6 @@
+# syntax=docker/dockerfile:1
+# Reconstitutes the Flatcar developer container rootfs as a single OCI image.
+# The build context must contain `rootfs.tar` (raw, uncompressed) extracted
+# from the Flatcar developer .bin partition by the publishing workflow.
+FROM scratch
+ADD rootfs.tar /
