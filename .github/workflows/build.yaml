@@ -52,7 +52,7 @@ jobs:
 
       - name: Checkout
         if: steps.filter.outputs.skip_track == 'false'
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Resolve current Flatcar version
         id: meta
@@ -112,7 +112,7 @@ jobs:
       - name: Cache rootfs tarball
         id: cache_rootfs
         if: steps.skip.outputs.skip_base == 'false'
-        uses: actions/cache@v5
+        uses: actions/cache@v6
         with:
           path: rootfs.tar
           key: rootfs-${{ runner.os }}-${{ matrix.flatcar_track }}-${{ steps.meta.outputs.version }}
