@@ -10,13 +10,8 @@ ARG FLATCAR_TRACK
 # Create a Flatcar Linux Developer image as defined in:
 # https://docs.flatcar-linux.org/os/kernel-modules/
 
-RUN emerge-gitclone \
-    && export $(cat /usr/share/coreos/release | xargs) \
-    && export OVERLAY_VERSION="${FLATCAR_TRACK}-${FLATCAR_VERSION}" \
-    && export PORTAGE_VERSION="${FLATCAR_TRACK}-${FLATCAR_VERSION}" \
-    && env \
-    && git -C /var/lib/portage/coreos-overlay checkout "tags/$OVERLAY_VERSION" \
-    && git -C /var/lib/portage/portage-stable checkout "tags/$PORTAGE_VERSION"
+# The release-aware helper sets up the checkout and any required submodules.
+RUN emerge-gitclone
 
 # try to use pre-built binaries and fall back to building from source
 RUN emerge -gKq --jobs 4 --load-average 4 coreos-sources || echo "failed to download binaries, fallback build from source:" && emerge -q --jobs 4 --load-average 4 coreos-sources
