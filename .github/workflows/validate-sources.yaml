@@ -1,0 +1,46 @@
+name: Validate Flatcar sources image
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .github/workflows/validate-sources.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: ${{ matrix.track }} ${{ matrix.version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Exercise a release from before the checkout move on beta/stable
+          # and the release that introduced the failure on alpha.
+          - track: alpha
+            version: '4890.0.0'
+          - track: beta
+            version: '4865.1.0'
+          - track: stable
+            version: '4757.2.4'
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Build sources image locally
+        env:
+          FLATCAR_VERSION: ${{ matrix.version }}
+        run: |
+          docker build --pull --platform linux/amd64 \
+            --build-arg BASE_IMAGE="${GITHUB_REPOSITORY,,}" \
+            --build-arg FLATCAR_VERSION="$FLATCAR_VERSION" \
+            --tag flatcar-sources-test .
+      - name: Verify kernel build files
+        run: |
+          docker run --rm --entrypoint /bin/sh flatcar-sources-test -ec '
+            test -s /usr/src/linux/.config
+            test -s /usr/src/linux/Module.symvers
+          '
